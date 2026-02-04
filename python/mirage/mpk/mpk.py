@@ -405,6 +405,17 @@ class MPK:
         self.persistent_kernel.compile(output_dir=output_dir, eos_token_id=self.model_builder.eos_token_id)
         print("Compiling mpk... done")
         self.is_compiled = True
+
+    def load_mpk_kernel(self, so_path: Optional[str] = None, output_dir: Optional[str] = None):
+        if not self.is_built:
+            raise ValueError("Model is not built yet")
+        self.persistent_kernel.load_mpk_kernel(
+            so_path=so_path,
+            output_dir=output_dir,
+            eos_token_id=self.model_builder.eos_token_id,
+        )
+        print("Loaded precompiled mpk... done")
+        self.is_compiled = True
         
     def init_request_func(self):
         self.persistent_kernel.init_request_func()
