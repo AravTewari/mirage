@@ -318,6 +318,77 @@ class PersistentKernel:
         assert paged_kv_indices_buffer.dtype == torch.int32, f"paged_kv_indices_buffer.dtype: {paged_kv_indices_buffer.dtype}"
         assert paged_kv_last_page_len_buffer.dtype == torch.int32, f"paged_kv_last_page_len_buffer.dtype: {paged_kv_last_page_len_buffer.dtype}"
 
+    def _launcher_filename(self):
+        ext_suffix = sysconfig.get_config_var("EXT_SUFFIX") or ".so"
+        return f"mpk_launcher_rank{self.mpi_rank}{ext_suffix}"
+
+    def _build_meta_tensor_ptrs(self):
+        meta_tensors = [
+            self.meta_tensors["step"],
+            self.meta_tensors["tokens"],
+            self.meta_tensors["input_tokens"],
+            self.meta_tensors["output_tokens"],
+            self.meta_tensors["num_new_tokens"],
+            self.meta_tensors["prompt_lengths"],
+            self.meta_tensors["qo_indptr_buffer"],
+            self.meta_tensors["paged_kv_indptr_buffer"],
+            self.meta_tensors["paged_kv_indices_buffer"],
+            self.meta_tensors["paged_kv_last_page_len_buffer"],
+        ]
+        meta_tensors_ptr = [tensor.data_ptr() for tensor in meta_tensors]
+        profiler_buffer_ptr = (
+            self.profiler_tensor.data_ptr() if self.profiler_tensor is not None else 0
+        )
+        return meta_tensors_ptr, profiler_buffer_ptr
+
+    def _resolve_launcher_path(self, so_path: Optional[str], output_dir: Optional[str]):
+        if so_path is not None:
+            return so_path
+        if output_dir is None:
+            raise ValueError("Either so_path or output_dir must be provided.")
+        return os.path.join(output_dir, self._launcher_filename())
+
+    def _load_launcher_module(self, so_path: str):
+        if not os.path.exists(so_path):
+            raise FileNotFoundError(f"Compiled megakernel shared object not found: {so_path}")
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location("__mirage_launcher", so_path)
+        mod = importlib.util.module_from_spec(spec)
+        if spec.loader is None:
+            raise RuntimeError(f"Failed to load launcher module from {so_path}")
+        spec.loader.exec_module(mod)
+        self.init_func = getattr(mod, "init_func")
+        self.launch_func = getattr(mod, "launch_func")
+        self.init_request_func = getattr(mod, "init_request_func")
+        self.finalize_func = getattr(mod, "finalize_func")
+
+    def load_mpk_kernel(
+        self,
+        so_path: Optional[str] = None,
+        output_dir: Optional[str] = None,
+        eos_token_id: Optional[int] = None,
+    ):
+        if self._is_compiled:
+            raise RuntimeError("Persistent kernel already compiled or loaded.")
+        resolved_so_path = self._resolve_launcher_path(so_path, output_dir)
+        self._load_launcher_module(resolved_so_path)
+        meta_tensors_ptr, profiler_buffer_ptr = self._build_meta_tensor_ptrs()
+        if eos_token_id is not None:
+            self.eos_token_id = eos_token_id
+        self.init_func(
+            meta_tensors_ptr,
+            profiler_buffer_ptr,
+            self.mpi_rank,
+            self.num_workers,
+            self.num_local_schedulers,
+            self.num_remote_schedulers,
+            self.max_seq_length,
+            self.total_num_requests,
+            self.eos_token_id,
+        )
+        self._is_compiled = True
+
     def attach_input(self, torch_tensor: torch.Tensor, name: str = None) -> DTensor:
         dims = tuple([d for d in torch_tensor.shape])
         strides = tuple([s for s in torch_tensor.stride()])
@@ -1339,7 +1410,7 @@ class PersistentKernel:
         results = self.kn_graph.generate_task_graph(num_gpus=self.world_size, my_gpu_id=self.mpi_rank)
 
         cuda_code_path = os.path.join(tempdir, "test.cu")
-        so_path = os.path.join(tempdir, "test.cpython-38-x86_64-linux-gnu.so")
+        so_path = os.path.join(tempdir, self._launcher_filename())
         # check json file
         json_file_path = os.path.join(tempdir, "task_graph.json")
         # build if files are not exist
@@ -1349,11 +1420,6 @@ class PersistentKernel:
         with open(cuda_code_path, "w") as f:
             f.write(results["cuda_code"] + HARD_CODE)
             
-        if output_dir is not None:
-            os.makedirs(output_dir, exist_ok=True)
-            shutil.copy(cuda_code_path, os.path.join(output_dir, f"test_rank{self.mpi_rank}.cu"))
-            shutil.copy(json_file_path, os.path.join(output_dir, f"task_graph_rank{self.mpi_rank}.json"))
-
         cc = shutil.which("nvcc")
         if cc is None:
             raise RuntimeError(
@@ -1471,33 +1537,16 @@ class PersistentKernel:
         print(cc_cmd)
         subprocess.check_call(cc_cmd)
 
-        import importlib.util
+        if output_dir is not None:
+            os.makedirs(output_dir, exist_ok=True)
+            shutil.copy(cuda_code_path, os.path.join(output_dir, f"test_rank{self.mpi_rank}.cu"))
+            shutil.copy(json_file_path, os.path.join(output_dir, f"task_graph_rank{self.mpi_rank}.json"))
+            shutil.copy(so_path, os.path.join(output_dir, self._launcher_filename()))
 
-        spec = importlib.util.spec_from_file_location("__mirage_launcher", so_path)
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
-        self.init_func = getattr(mod, "init_func")
-        self.launch_func = getattr(mod, "launch_func")
-        self.init_request_func = getattr(mod, "init_request_func")
-        self.finalize_func = getattr(mod, "finalize_func")
+        self._load_launcher_module(so_path)
         print("Finished megakernel compilation...")
 
-        #meta_tensors_ptr = [tensor.data_ptr() for tensor in self.meta_tensors]
-        meta_tensors = list()
-        meta_tensors.append(self.meta_tensors["step"])
-        meta_tensors.append(self.meta_tensors["tokens"])
-        meta_tensors.append(self.meta_tensors["input_tokens"])
-        meta_tensors.append(self.meta_tensors["output_tokens"])
-        meta_tensors.append(self.meta_tensors["num_new_tokens"])
-        meta_tensors.append(self.meta_tensors["prompt_lengths"])
-        meta_tensors.append(self.meta_tensors["qo_indptr_buffer"])
-        meta_tensors.append(self.meta_tensors["paged_kv_indptr_buffer"])
-        meta_tensors.append(self.meta_tensors["paged_kv_indices_buffer"])
-        meta_tensors.append(self.meta_tensors["paged_kv_last_page_len_buffer"])
-        meta_tensors_ptr = [tensor.data_ptr() for tensor in meta_tensors]
-        profiler_buffer_ptr = (
-            self.profiler_tensor.data_ptr() if self.profiler_tensor is not None else 0
-        )
+        meta_tensors_ptr, profiler_buffer_ptr = self._build_meta_tensor_ptrs()
         self.eos_token_id = kwargs.get("eos_token_id", self.eos_token_id)
         self.init_func(
             meta_tensors_ptr,
